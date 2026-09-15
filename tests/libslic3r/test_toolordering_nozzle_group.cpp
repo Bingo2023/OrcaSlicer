@@ -8,6 +8,8 @@
 #include "libslic3r/Print.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
+#include "test_utils.hpp"
+
 #include <algorithm>
 #include <map>
 #include <set>
@@ -158,6 +160,50 @@ TEST_CASE("H2C multi-nozzle: filaments get distinct nozzles on the 6-nozzle extr
         REQUIRE(first.has_value());
         REQUIRE(first->extruder_id == 1);
         REQUIRE(first->group_id == group.get_nozzle_id(f));
+    }
+}
+
+TEST_CASE("Grouping context spans the filament count with mis-sized config arrays", "[ToolOrdering][H2C]")
+{
+    // FilamentGroup indexes the grouping context's filament_info by filament id, so a short
+    // per-filament array must not shorten it: the reads run off the end.
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    // Single 6-nozzle extruder: opens the grouping engine without needing a BBL multi-extruder.
+    config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {0.4};
+    config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count", true)->values = {6};
+    config.option<ConfigOptionStrings>("extruder_nozzle_stats", true)->values = {"Standard#6"};
+
+    // Four filaments, with filament_type / filament_is_support left short on purpose.
+    config.option<ConfigOptionStrings>("filament_colour", true)->values = {"#FF0000", "#00FF00", "#0000FF", "#FFFF00"};
+    config.option<ConfigOptionStrings>("filament_type", true)->values = {"PLA"};
+    config.option<ConfigOptionBools>("filament_is_support", true)->values = {0};
+    config.option<ConfigOptionFloats>("filament_diameter", true)->values = {1.75, 1.75, 1.75, 1.75};
+    config.option<ConfigOptionInts>("filament_map", true)->values = {1, 1, 1, 1};
+    config.option<ConfigOptionFloats>("flush_volumes_matrix", true)->values = std::vector<double>(16, 140.);
+    config.option<ConfigOptionFloats>("flush_multiplier", true)->values = {1.};
+
+    Model model;
+    model.add_object("cube", "", make_cube(20, 20, 20))->add_instance();
+
+    Print print;
+    print.apply(model, config);
+    // apply() does not pad the per-filament arrays, so the mis-sizing survives into the engine.
+    REQUIRE(print.config().filament_type.values.size() < print.config().filament_colour.values.size());
+
+    std::vector<std::vector<unsigned int>> layer_filaments = {{0, 1}, {1, 2}, {2, 3}};
+
+    SECTION("short per-filament arrays still yield one entry per filament") {
+        auto result = ToolOrdering::get_recommended_filament_maps(layer_filaments, &print, FilamentMapMode::fmmAutoForFlush, {}, {});
+        REQUIRE(result.get_extruder_map(false).size() == 4);
+        for (int f = 0; f < 4; ++f)
+            REQUIRE(result.get_extruder_id(f) == 0);
+    }
+
+    SECTION("filament_ids longer than the filament count is truncated, not paired past the end") {
+        config.option<ConfigOptionStrings>("filament_ids", true)->values = {"a", "b", "c", "d", "e", "f"};
+        print.apply(model, config);
+        auto result = ToolOrdering::get_recommended_filament_maps(layer_filaments, &print, FilamentMapMode::fmmAutoForFlush, {}, {});
+        REQUIRE(result.get_extruder_map(false).size() == 4);
     }
 }
 
@@ -708,10 +754,9 @@ TEST_CASE("Sequential selector prints publish a stitched result and cache the pl
     REQUIRE(print.config().filament_self_index.values.size() >= print.config().filament_map.values.size());
 
     // Export must consume the cached plans and produce g-code without throwing.
-    boost::filesystem::path gcode_path = boost::filesystem::temp_directory_path() / "orca_seq_dynamic_publish_test.gcode";
-    REQUIRE_NOTHROW(print.export_gcode(gcode_path.string(), nullptr, nullptr));
-    REQUIRE(boost::filesystem::exists(gcode_path));
-    boost::filesystem::remove(gcode_path);
+    ScopedTemporaryFile gcode(".gcode");
+    REQUIRE_NOTHROW(print.export_gcode(gcode.string(), nullptr, nullptr));
+    REQUIRE(boost::filesystem::exists(gcode.path()));
 }
 
 TEST_CASE("Per-variant expansion gives migrating filaments one slot per variant", "[PrintConfig][H2C][Dynamic]")
